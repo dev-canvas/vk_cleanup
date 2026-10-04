@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 ACCESS_TOKEN = os.environ["VK_ACCESS_TOKEN"]
 GROUP_ID = int(os.environ["VK_GROUP_ID"])
-CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "").split(",")  # например: "https://front.example.com"
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "").split(",")
 
 API_VERSION = "5.199"
 API_BASE = "https://api.vk.com/method/"
@@ -98,15 +98,16 @@ def check_users(user_ids: list[int]) -> list[int]:
         for user in resp:
             if user.get("deactivated") in ("deleted", "banned"):
                 inactive.append(user["id"])
+        _task_status["progress"]["processed"] = min(i + 100, len(user_ids))
         time.sleep(REQUEST_PAUSE)
     return inactive
 
 
-def remove_users(group_id: int, user_ids: list[int], total: int) -> tuple[int, list[str]]:
+def remove_users(group_id: int, user_ids: list[int]) -> tuple[int, list[str]]:
     removed = 0
     errors = []
     # 7 — нет прав, 701 — «нельзя удалить этого пользователя»: оба пропускаем
-    for uid in user_ids:
+    for idx, uid in enumerate(user_ids, start=1):
         resp = api_call("groups.removeUser", {
             "group_id": group_id,
             "user_id": uid,
@@ -115,7 +116,7 @@ def remove_users(group_id: int, user_ids: list[int], total: int) -> tuple[int, l
             removed += 1
         else:
             errors.append(str(uid))
-        _task_status["progress"]["processed"] = removed + len(errors)
+        _task_status["progress"]["processed"] = idx
         time.sleep(REQUEST_PAUSE)
     return removed, errors
 
@@ -139,7 +140,7 @@ def run_cleanup():
             }
             return
 
-        removed, errors = remove_users(GROUP_ID, inactive, len(inactive))
+        removed, errors = remove_users(GROUP_ID, inactive)
         _task_status["result"] = {
             "total_members": len(members),
             "inactive_found": len(inactive),
@@ -157,19 +158,26 @@ def run_cleanup():
 # ──────────────────────────── Эндпоинты ────────────────────────────
 
 @app.post("/clean")
-def clean():
+def clean(background_tasks: BackgroundTasks):
     """Запускает очистку в фоне. 409, если задача уже идёт."""
     if _task_status["running"]:
         return JSONResponse(status_code=409, content={"error": "Задача уже выполняется"})
 
     _task_status.update(running=True, result=None, progress=None)
-
-    def _task():
-        run_cleanup()
-
-    # BackgroundTasks сам передаёт задачу после отправки ответа
-    from fastapi import BackgroundTasks as BT  # noqa — см. сигнатуру ниже
+    background_tasks.add_task(run_cleanup)   # ← вот это и запускает работу
     return {"started": True}
 
 
-# ВАЖНО: BackgroundTasks должен приходить как зависимость, иначе задача не запустится
+@app.get("/status")
+def status():
+    """Статус задачи: running, живой прогресс и результат."""
+    return {
+        "running": _task_status["running"],
+        "progress": _task_status["progress"],
+        "result": _task_status["result"],
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
